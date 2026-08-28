@@ -1,0 +1,272 @@
+trigger: none
+
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+resources:
+  repositories:
+  - repository: app
+    type: github
+    name: mohamedkaba4/E-commerce
+    endpoint: mohamedkaba4
+
+variables:
+  prodConnection: 'sc-mcrest-prod'
+
+  tfStateContainer: 'tfstate'
+
+  foundationStateKey: 'foundation-prod.tfstate'
+  workloadStateKey: 'workloads-prod.tfstate'
+
+  pipelinePrincipalObjectId: '$(PIPELINE_PRINCIPAL_OBJECT_ID)'
+
+stages:
+
+- stage: ValidateRepos
+  displayName: Validate Repositories
+
+  jobs:
+  - job: Validate
+    steps:
+    - checkout: self
+      path: s/infra
+
+    - checkout: app
+      path: s/E-commerce
+
+    - script: |
+        echo "Current directory:"
+        pwd
+
+        echo "Checked out repositories:"
+        ls -la $(Pipeline.Workspace)
+
+        echo "Infra repo:"
+        ls -la $(Pipeline.Workspace)/s
+
+        echo "App repo:"
+        find $(Pipeline.Workspace) -maxdepth 2 -type d | head -30
+      displayName: Verify Both Repositories
+
+
+- stage: Bootstrap
+  displayName: Bootstrap Terraform Backend
+  dependsOn: ValidateRepos
+  condition: false
+
+  jobs:
+  - job: BootstrapTerraform
+    steps:
+    - checkout: self
+      path: s/infra
+
+    - task: AzureCLI@2
+      name: bootstrapOutputs
+      displayName: Apply Terraform Bootstrap
+      inputs:
+        azureSubscription: 'sc-mcrest-prod'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          TFSTATE_RG="rg-mavencrest-tfstate"
+
+          STORAGE_ACCOUNT=$(az storage account list \
+            --resource-group "$TFSTATE_RG" \
+            --query "[?starts_with(name, 'stmavencresttf')].name | [0]" \
+            -o tsv)
+
+            if [ -n "$STORAGE_ACCOUNT" ]; then
+            echo "Existing Terraform backend found: $STORAGE_ACCOUNT"
+          else
+            echo "Terraform backend not found. Creating it..."
+
+          cd $(Pipeline.Workspace)/s/infra/terraform/bootstrap
+
+          terraform init
+
+          terraform plan \
+           -var="pipeline_principal_object_id=$(pipelinePrincipalObjectId)" \
+           -out=bootstrap.tfplan
+
+          terraform apply \
+            -auto-approve \
+            bootstrap.tfplan
+
+          TFSTATE_STORAGE_ACCOUNT=$(terraform output -raw storage_account_name)
+          TFSTATE_RG_NAME=$(terraform output -raw resource_group_name)
+
+            echo "##vso[task.setvariable variable=tfStateStorageAccount;isOutput=true]$TFSTATE_STORAGE_ACCOUNT"
+            echo "##vso[task.setvariable variable=tfStateResourceGroup;isOutput=true]$TFSTATE_RG_NAME"
+  
+- stage: Foundation
+  displayName: Deploy Foundation
+  dependsOn: ValidateRepos
+
+  jobs:
+  - job: TerraformFoundation
+    steps:
+    - checkout: self
+      path: s/infra
+
+      displayName: Install Terraform
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y gnupg software-properties-common curl
+
+        curl -fsSL https://apt.releases.hashicorp.com/gpg \
+          | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+        https://apt.releases.hashicorp.com \
+        $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+        sudo apt-get update
+        sudo apt-get install -y terraform
+
+        terraform version
+
+    - task: AzureCLI@2
+      displayName: Terraform Foundation
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          cd $(Pipeline.Workspace)/s/infra/terraform/foundation
+
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+            -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+            -backend-config="container_name=$(tfStateContainer)" \
+            -backend-config="key=$(foundationStateKey)"
+
+          terraform plan \
+            -var-file="prod.tfvars" \
+            -out=foundation.tfplan
+
+          terraform apply \
+            -auto-approve \
+            foundation.tfplan
+
+- stage: BuildInitialImages
+  displayName: Build Initial Images
+  dependsOn: Foundation
+
+  jobs:
+  - job: BuildImages
+    steps:
+    - checkout: app
+      path: s/E-commerce
+
+    - task: AzureCLI@2
+      displayName: Login to ACR
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az acr login --name acrmavencrestprodzcjo
+
+    - script: |
+        cd $(Pipeline.Workspace)/s/E-commerce
+
+        docker build \
+          --platform linux/amd64 \
+          -f apps/storefront/Dockerfile \
+          -t acrmavencrestprodzcjo.azurecr.io/mavencrest-storefront:bootstrap \
+          .
+
+        docker push \
+          acrmavencrestprodzcjo.azurecr.io/mavencrest-storefront:bootstrap
+      displayName: Build Storefront
+
+    - script: |
+        cd $(Pipeline.Workspace)/s/E-commerce
+
+        docker build \
+          --platform linux/amd64 \
+          -f apps/admin/Dockerfile \
+          -t acrmavencrestprodzcjo.azurecr.io/mavencrest-admin:bootstrap \
+          .
+
+        docker push \
+          acrmavencrestprodzcjo.azurecr.io/mavencrest-admin:bootstrap
+      displayName: Build Admin
+
+- stage: Workloads
+  displayName: Deploy Workloads
+  dependsOn: BuildInitialImages
+
+  jobs: 
+  - job: TerraformWorkloads
+    steps:
+    - checkout: self
+      path: s/infra
+
+      displayName: Install Terraform
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y gnupg software-properties-common curl
+
+        curl -fsSL https://apt.releases.hashicorp.com/gpg \
+          | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+        https://apt.releases.hashicorp.com \
+        $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+        sudo apt-get update
+        sudo apt-get install -y terraform
+
+        terraform version
+    
+    - task: AzureCLI@2
+      displayName: Terraform Workloads
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          cd $(Pipeline.Workspace)/s/infra/terraform/workload
+
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=$(tfStateResourceGroup)" \
+            -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+            -backend-config="container_name=$(tfStateContainer)" \
+            -backend-config="key=$(workloadStateKey)"
+
+          terraform plan \
+            -var-file="prod.tfvars" \
+            -out=workload.tfplan
+
+          terraform apply \
+            -auto-approve \
+            workload.tfplan
+
+- stage: ValidateDeployment
+  displayName: Validate Deployment
+  dependsOn: Workloads
+
+  jobs:
+  - job: HealthCheck
+    steps:
+    - script: |
+        echo "Testing Storefront..."
+        curl --fail \
+          --retry 10 \
+          --retry-delay 10 \
+          https://store.az.mavencrest.site/api/health
+
+        echo "Testing Admin..."
+        curl --fail \
+          --retry 10 \
+          --retry-delay 10 \
+          https://admin.az.mavencrest.site/api/health
+
+        echo "Environment successfully rebuilt."
+      displayName: Verify Production
