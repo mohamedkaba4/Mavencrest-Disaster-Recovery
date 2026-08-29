@@ -2,7 +2,7 @@
 
 Disaster recovery orchestration for the Mavencrest Azure container platform.
 
-This repository handles a full recovery using two authoritative source repositories:
+This repository handles a full recovery using two repositories as its source of truth:
 
 - `MavencrestAzure` — Terraform IaC
 - `E-commerce` — application source and Docker images
