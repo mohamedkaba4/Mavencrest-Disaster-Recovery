@@ -1,0 +1,479 @@
+trigger: none
+pr: none
+
+parameters:
+- name: recoveryMode
+  displayName: Recovery Mode
+  type: string
+  default: auto
+  values:
+  - auto
+  - full-rebuild
+  - validate-only
+
+pool:
+  vmImage: ubuntu-latest
+
+resources:
+  repositories:
+  - repository: infra
+    type: github
+    name: mohamedkaba4/MavencrestAzure
+    endpoint: mohamedkaba4
+
+  - repository: app
+    type: github
+    name: mohamedkaba4/E-commerce
+    endpoint: mohamedkaba4
+
+
+variables:
+  prodConnection: 'sc-mcrest-prod'
+  tfStateContainer: 'tfstate'
+  foundationStateKey: 'foundation-prod.tfstate'
+  workloadStateKey: 'workloads-prod.tfstate'
+
+stages:
+
+- stage: ValidateRepos
+  displayName: Validate DR Sources
+  jobs:
+  - job: Validate
+    steps:
+    - checkout: self
+      path: s/dr
+
+    - checkout: infra
+      path: s/infra
+
+    - checkout: app
+      path: s/app
+
+    - script: |
+        set -euo pipefail
+
+        echo "DR repo:"
+        ls -la $(Pipeline.Workspace)/s/dr
+
+        echo "Infrastructure repo:"
+        ls -la $(Pipeline.Workspace)/s/infra
+
+        echo "Application repo:"
+        ls -la $(Pipeline.Workspace)/s/app
+      displayName: Verify Recovery Sources
+
+
+- stage: Preflight
+  displayName: DR Preflight
+  dependsOn: ValidateRepos
+
+  jobs:
+  - job: ClassifyRecovery
+    steps:
+    - checkout: self
+      path: s/dr
+
+    - task: AzureCLI@2
+      name: drClassification
+      displayName: Classify Recovery Scenario
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          echo "Requested recovery mode: ${{ parameters.recoveryMode }}"
+
+          STORAGE_ACCOUNT=$(az storage account list \
+            --query "[?tags.workload=='mavencrest' && tags.purpose=='terraform-state'].name | [0]" \
+            -o tsv)
+
+          TFSTATE_RG=$(az storage account list \
+            --query "[?tags.workload=='mavencrest' && tags.purpose=='terraform-state'].resourceGroup | [0]" \
+            -o tsv)
+
+          PROD_RG=$(az group exists \
+            --name rg-mavencrest-prod)
+
+          if [ -n "$STORAGE_ACCOUNT" ]; then
+            BACKEND_EXISTS=true
+          else
+            BACKEND_EXISTS=false
+          fi
+
+          echo "Terraform backend exists: $BACKEND_EXISTS"
+          echo "Production resource group exists: $PROD_RG"
+
+          if [ "${{ parameters.recoveryMode }}" = "full-rebuild" ]; then
+            RECOVERY_SCENARIO="full-rebuild"
+          elif [ "${{ parameters.recoveryMode }}" = "validate-only" ]; then
+            RECOVERY_SCENARIO="validate-only"
+          elif [ "$BACKEND_EXISTS" = "true" ] && [ "$PROD_RG" = "true" ]; then
+            RECOVERY_SCENARIO="reconcile"
+          elif [ "$BACKEND_EXISTS" = "false" ] && [ "$PROD_RG" = "true" ]; then
+            RECOVERY_SCENARIO="state-loss"
+          else
+            RECOVERY_SCENARIO="full-rebuild"
+          fi
+
+          echo "Recovery scenario: $RECOVERY_SCENARIO"
+
+          echo "##vso[task.setvariable variable=recoveryScenario;isOutput=true]$RECOVERY_SCENARIO"
+          echo "##vso[task.setvariable variable=tfStateStorageAccount;isOutput=true]$STORAGE_ACCOUNT"
+          echo "##vso[task.setvariable variable=tfStateResourceGroup;isOutput=true]$TFSTATE_RG"
+
+
+- stage: RecoveryDecision
+  displayName: Recovery Decision
+  dependsOn: Preflight
+
+  variables:
+    recoveryScenario: $[ stageDependencies.Preflight.ClassifyRecovery.outputs['drClassification.recoveryScenario'] ]
+
+  jobs:
+  - job: Report
+    steps:
+    - script: |
+        set -euo pipefail
+
+        echo "=========================================="
+        echo "MAVENCREST DISASTER RECOVERY"
+        echo "=========================================="
+        echo "Scenario: $(recoveryScenario)"
+        echo ""
+
+        case "$(recoveryScenario)" in
+          reconcile)
+            echo "Infrastructure and Terraform state exist."
+            echo "Next action: controlled Terraform reconciliation."
+            ;;
+
+          state-loss)
+            echo "WARNING: Azure infrastructure exists but Terraform backend is missing."
+            echo "Do NOT rebuild infrastructure."
+            echo "Next action: recover state or import existing resources."
+            ;;
+
+          full-rebuild)
+            echo "Production infrastructure is considered unavailable."
+            echo "Next action: execute full platform rebuild."
+            ;;
+
+          validate-only)
+            echo "Validation-only mode selected."
+            ;;
+
+          *)
+            echo "ERROR: Unknown DR scenario."
+            exit 1
+            ;;
+        esac
+      displayName: Report Recovery Strategy
+
+- stage: ResolveBackend
+  displayName: Resolve DR Terraform Backend
+  dependsOn:
+  - Preflight
+  - RecoveryDecision
+
+  variables:
+    recoveryScenario: $[ stageDependencies.Preflight.ClassifyRecovery.outputs['drClassification.recoveryScenario'] ]
+    discoveredStorageAccount: $[ stageDependencies.Preflight.ClassifyRecovery.outputs['drClassification.tfStateStorageAccount'] ]
+    discoveredResourceGroup: $[ stageDependencies.Preflight.ClassifyRecovery.outputs['drClassification.tfStateResourceGroup'] ]
+
+  condition: and(
+    succeeded(),
+    eq(dependencies.Preflight.outputs['ClassifyRecovery.drClassification.recoveryScenario'], 'full-rebuild')
+    )
+
+  jobs:
+  - job: Resolve
+    steps:
+    - checkout: infra
+      path: s/infra
+
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y gnupg software-properties-common curl
+
+        curl -fsSL https://apt.releases.hashicorp.com/gpg \
+          | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+        https://apt.releases.hashicorp.com \
+        $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+        sudo apt-get update
+        sudo apt-get install -y terraform
+
+        terraform version
+      displayName: Install Terraform
+
+    - task: AzureCLI@2
+      name: backendOutputs
+      displayName: Resolve or Rebuild Backend
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        addSpnToEnvironment: true
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          STORAGE_ACCOUNT="$(discoveredStorageAccount)"
+          TFSTATE_RG="$(discoveredResourceGroup)"
+
+          if [ -n "$STORAGE_ACCOUNT" ]; then
+            echo "Existing Terraform backend found."
+          else
+            echo "Terraform backend is unavailable."
+            echo "Rebuilding Terraform backend..."
+
+            SP_OBJECT_ID=$(az ad sp show \
+              --id "$servicePrincipalId" \
+              --query id \
+              -o tsv)
+
+            cd $(Pipeline.Workspace)/s/infra/terraform/bootstrap
+
+            terraform init
+
+            terraform plan \
+              -var="pipeline_principal_object_id=$SP_OBJECT_ID" \
+              -out=bootstrap.tfplan
+
+            terraform apply \
+              -auto-approve \
+              bootstrap.tfplan
+
+            STORAGE_ACCOUNT=$(terraform output -raw storage_account_name)
+            TFSTATE_RG=$(terraform output -raw resource_group_name)
+          fi
+
+          echo "Backend storage: $STORAGE_ACCOUNT"
+          echo "Backend RG: $TFSTATE_RG"
+
+          echo "##vso[task.setvariable variable=tfStateStorageAccount;isOutput=true]$STORAGE_ACCOUNT"
+          echo "##vso[task.setvariable variable=tfStateResourceGroup;isOutput=true]$TFSTATE_RG"
+
+- stage: FoundationPlan
+  displayName: DR Foundation Plan
+  dependsOn:
+  - ResolveBackend
+
+  variables:
+    tfStateStorageAccount: $[ stageDependencies.ResolveBackend.Resolve.outputs['backendOutputs.tfStateStorageAccount'] ]
+
+  jobs:
+  - job: Plan
+    steps:
+    - checkout: infra
+      path: s/infra
+
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y gnupg software-properties-common curl
+
+        curl -fsSL https://apt.releases.hashicorp.com/gpg \
+          | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+        https://apt.releases.hashicorp.com \
+        $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+        sudo apt-get update
+        sudo apt-get install -y terraform
+      displayName: Install Terraform
+
+    - task: AzureCLI@2
+      displayName: Plan Foundation Recovery
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          export ARM_USE_CLI=true
+          export ARM_USE_AZUREAD=true
+
+          echo "Verifying state access..."
+          az storage blob list \
+            --account-name "$(tfStateStorageAccount)" \
+            --container-name "$(tfStateContainer)" \
+            --auth-mode login \
+            --num-results 1 \
+            -o none
+
+          terraform -chdir=$(Pipeline.Workspace)/s/infra/terraform/foundation init -reconfigure \
+            -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+            -backend-config="container_name=$(tfStateContainer)" \
+            -backend-config="key=$(foundationStateKey)" \
+            -backend-config="use_cli=true" \
+            -backend-config="use_azuread_auth=true"
+
+          terraform -chdir=$(Pipeline.Workspace)/s/infra/terraform/foundation plan \
+            -var-file="prod.tfvars" \
+            -out=foundation.tfplan
+
+          echo "Checking plan for destructive actions..."
+
+          DESTROYS=$(terraform \
+            -chdir=$(Pipeline.Workspace)/s/infra/terraform/foundation \
+            show -json foundation.tfplan \
+            | jq '[.resource_changes[]? | select(.change.actions | index("delete"))] | length')
+
+          echo "Resources requiring deletion/replacement: $DESTROYS"
+
+          if [ "$DESTROYS" -gt 0 ]; then
+            echo "DR safety check failed."
+            echo "Foundation plan contains destructive operations."
+            exit 1
+          fi
+
+    - publish: $(Pipeline.Workspace)/s/infra/terraform/foundation/foundation.tfplan
+      artifact: foundation-plan
+      displayName: Publish Foundation Plan
+
+- stage: FoundationApply
+  displayName: DR Foundation Apply
+  dependsOn:
+  - FoundationPlan
+  - ResolveBackend
+
+  variables:
+    tfStateStorageAccount: $[ stageDependencies.ResolveBackend.Resolve.outputs['backendOutputs.tfStateStorageAccount'] ]
+
+  jobs:
+  - deployment: ApplyFoundation
+    displayName: Apply Approved Foundation Plan
+    environment: Prod-DR
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: infra
+            path: s/infra
+
+          - download: current
+            artifact: foundation-plan
+
+          - script: |
+              sudo apt-get update
+              sudo apt-get install -y gnupg software-properties-common curl
+
+              curl -fsSL https://apt.releases.hashicorp.com/gpg \
+                | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+              echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+              https://apt.releases.hashicorp.com \
+              $(lsb_release -cs) main" \
+                | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+              sudo apt-get update
+              sudo apt-get install -y terraform
+            displayName: Install Terraform
+
+          - task: AzureCLI@2
+            displayName: Apply Foundation Recovery
+            inputs:
+              azureSubscription: '$(prodConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                export ARM_USE_CLI=true
+                export ARM_USE_AZUREAD=true
+
+                terraform -chdir=$(Pipeline.Workspace)/s/infra/terraform/foundation init -reconfigure \
+                  -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+                  -backend-config="container_name=$(tfStateContainer)" \
+                  -backend-config="key=$(foundationStateKey)" \
+                  -backend-config="use_cli=true" \
+                  -backend-config="use_azuread_auth=true"
+
+                terraform -chdir=$(Pipeline.Workspace)/s/infra/terraform/foundation apply \
+                  -auto-approve \
+                  $(Pipeline.Workspace)/foundation-plan/foundation.tfplan
+
+- stage: BuildRecoveryImages
+  displayName: Build DR Application Images
+  dependsOn:
+  - FoundationApply
+  - ResolveBackend
+
+  variables:
+    tfStateStorageAccount: $[ stageDependencies.ResolveBackend.Resolve.outputs['backendOutputs.tfStateStorageAccount'] ]
+
+  jobs:
+  - job: BuildImages
+    steps:
+    - checkout: infra
+      path: s/infra
+
+    - checkout: app
+      path: s/app
+
+    - task: AzureCLI@2
+      name: imageOutputs
+      displayName: Resolve ACR and Login
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          export ARM_USE_CLI=true
+          export ARM_USE_AZUREAD=true
+
+          terraform -chdir=$(Pipeline.Workspace)/s/infra/terraform/foundation init -reconfigure \
+            -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+            -backend-config="container_name=$(tfStateContainer)" \
+            -backend-config="key=$(foundationStateKey)" \
+            -backend-config="use_cli=true" \
+            -backend-config="use_azuread_auth=true"
+
+          ACR_NAME=$(terraform \
+            -chdir=$(Pipeline.Workspace)/s/infra/terraform/foundation \
+            output -raw container_registry_name)
+
+          ACR_LOGIN_SERVER=$(terraform \
+            -chdir=$(Pipeline.Workspace)/s/infra/terraform/foundation \
+            output -raw container_registry_login_server)
+
+          az acr login --name "$ACR_NAME"
+
+          echo "##vso[task.setvariable variable=acrLoginServer;isOutput=true]$ACR_LOGIN_SERVER"
+
+    - script: |
+        set -euo pipefail
+
+        cd $(Pipeline.Workspace)/s/app
+
+        ACR_LOGIN_SERVER="$(imageOutputs.acrLoginServer)"
+        IMAGE_TAG="dr-$(Build.BuildId)"
+
+        docker build \
+          --platform linux/amd64 \
+          -f apps/storefront/Dockerfile \
+          -t "$ACR_LOGIN_SERVER/mavencrest-storefront:$IMAGE_TAG" \
+          .
+
+        docker push \
+          "$ACR_LOGIN_SERVER/mavencrest-storefront:$IMAGE_TAG"
+
+        docker build \
+          --platform linux/amd64 \
+          -f apps/admin/Dockerfile \
+          -t "$ACR_LOGIN_SERVER/mavencrest-admin:$IMAGE_TAG" \
+          .
+
+        docker push \
+          "$ACR_LOGIN_SERVER/mavencrest-admin:$IMAGE_TAG"
+      displayName: Build and Push DR Images
