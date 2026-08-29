@@ -80,3 +80,8 @@ The DR pipeline is:
 **Note:** The current automatic recovery classifier uses the Terraform
 > backend and production resource group as its primary signals.
 > Resource-level health and partial-outage detection will be added in a later update.
+
+> An expensansion to the project would also include:
+  cloud-based disaster recovery automated backup policies, 
+  cross-region replication,
+  rapid failover to improve business continuity while minimizing downtime.
