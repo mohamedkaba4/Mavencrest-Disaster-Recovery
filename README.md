@@ -76,3 +76,7 @@ The DR pipeline is:
 - designed to separate plan from apply
 - protected from automatically rebuilding resources during state-loss scenarios or other partially incomplete cases
 - intended to use Azure DevOps production approvals before destructive recovery actions
+
+**Note:** The current automatic recovery classifier uses the Terraform
+> backend and production resource group as its primary signals.
+> Resource-level health and partial-outage detection will be added in a
