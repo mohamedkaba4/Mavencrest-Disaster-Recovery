@@ -1,7 +1,22 @@
 # Mavencrest Disaster Recovery
 
-Disaster recovery orchestration for the Mavencrest Azure container platform.
+Enterprise-style disaster recovery automation for the Mavencrest Azure container environment using Azure DevOps, Terraform, Azure CLI, and automated recovery decision options.
 
+This project demonstrates how infrastructure recovery can be orchestrated safely after partial outages, complete infrastructure loss, or Terraform state-related failures. Rather than immediately running Terraform to recreate resources, the  pipeline first determines the current state of the environment and selects the safest recovery path.
+
+Preflight 
+     ↓
+Recovery Decision 
+     ↓ 
+Recovery Process 
+     ↓ 
+Validation
+
+## Recovery Modes
+auto — Detect the current failure condition and choose a recovery strategy (healthy,
+partial-recovery, full-rebuild, or state-recovery-required)
+full-rebuild — Rebuild the production infrastructure
+validate-only — Run recovery checks without making changes
 This repository handles a full recovery using two repositories as its source of truth:
 
 - `MavencrestAzure` — Terraform IaC
@@ -67,21 +82,21 @@ AUTO classification
      Workload APPLY
           ↓
      Health checks
-## Safety
+```
 
-The DR pipeline is:
-
-- manually triggered
-- scenario-aware based on recovry scenerios
-- designed to separate plan from apply
-- protected from automatically rebuilding resources during state-loss scenarios or other partially incomplete cases
-- intended to use Azure DevOps production approvals before destructive recovery actions
+##Safety Features
+Manual-only DR execution
+Terraform backend/state checks
+Azure resource detection
+State-loss protection
+Planned destructive Terraform plan detection
+Post-recovery validation
 
 **Note:** The current automatic recovery classifier uses the Terraform
 > backend and production resource group as its primary signals.
 > Resource-level health and partial-outage detection will be added in a later update.
 
-> An expensansion to the project would also include:
+> An expansion to the project would also include:
   cloud-based disaster recovery automated backup policies, 
   cross-region replication,
   rapid failover to improve business continuity while minimizing downtime.
