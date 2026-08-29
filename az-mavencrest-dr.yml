@@ -1,0 +1,171 @@
+trigger: none
+pr: none
+
+parameters:
+- name: recoveryMode
+  displayName: Recovery Mode
+  type: string
+  default: auto
+  values:
+  - auto
+  - full-rebuild
+  - validate-only
+
+pool:
+  vmImage: ubuntu-latest
+
+resources:
+  repositories:
+  - repository: infra
+    type: github
+    name: mohamedkaba4/MavencrestAzure
+    endpoint: mohamedkaba4
+
+  - repository: app
+    type: github
+    name: mohamedkaba4/E-commerce
+    endpoint: mohamedkaba4
+
+variables:
+  prodConnection: 'sc-mcrest-prod'
+  tfStateContainer: 'tfstate'
+  foundationStateKey: 'foundation-prod.tfstate'
+  workloadStateKey: 'workloads-prod.tfstate'
+
+stages:
+
+- stage: ValidateRepos
+  displayName: Validate DR Sources
+  jobs:
+  - job: Validate
+    steps:
+    - checkout: self
+      path: s/dr
+
+    - checkout: infra
+      path: s/infra
+
+    - checkout: app
+      path: s/app
+
+    - script: |
+        set -euo pipefail
+
+        echo "DR repo:"
+        ls -la $(Pipeline.Workspace)/s/dr
+
+        echo "Infrastructure repo:"
+        ls -la $(Pipeline.Workspace)/s/infra
+
+        echo "Application repo:"
+        ls -la $(Pipeline.Workspace)/s/app
+      displayName: Verify Recovery Sources
+
+
+- stage: Preflight
+  displayName: DR Preflight
+  dependsOn: ValidateRepos
+
+  jobs:
+  - job: ClassifyRecovery
+    steps:
+    - checkout: self
+      path: s/dr
+
+    - task: AzureCLI@2
+      name: drClassification
+      displayName: Classify Recovery Scenario
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          echo "Requested recovery mode: ${{ parameters.recoveryMode }}"
+
+          STORAGE_ACCOUNT=$(az storage account list \
+            --query "[?tags.workload=='mavencrest' && tags.purpose=='terraform-state'].name | [0]" \
+            -o tsv)
+
+          TFSTATE_RG=$(az storage account list \
+            --query "[?tags.workload=='mavencrest' && tags.purpose=='terraform-state'].resourceGroup | [0]" \
+            -o tsv)
+
+          PROD_RG=$(az group exists \
+            --name rg-mavencrest-prod)
+
+          if [ -n "$STORAGE_ACCOUNT" ]; then
+            BACKEND_EXISTS=true
+          else
+            BACKEND_EXISTS=false
+          fi
+
+          echo "Terraform backend exists: $BACKEND_EXISTS"
+          echo "Production resource group exists: $PROD_RG"
+
+          if [ "${{ parameters.recoveryMode }}" = "full-rebuild" ]; then
+            RECOVERY_SCENARIO="full-rebuild"
+          elif [ "${{ parameters.recoveryMode }}" = "validate-only" ]; then
+            RECOVERY_SCENARIO="validate-only"
+          elif [ "$BACKEND_EXISTS" = "true" ] && [ "$PROD_RG" = "true" ]; then
+            RECOVERY_SCENARIO="reconcile"
+          elif [ "$BACKEND_EXISTS" = "false" ] && [ "$PROD_RG" = "true" ]; then
+            RECOVERY_SCENARIO="state-loss"
+          else
+            RECOVERY_SCENARIO="full-rebuild"
+          fi
+
+          echo "Recovery scenario: $RECOVERY_SCENARIO"
+
+          echo "##vso[task.setvariable variable=recoveryScenario;isOutput=true]$RECOVERY_SCENARIO"
+          echo "##vso[task.setvariable variable=tfStateStorageAccount;isOutput=true]$STORAGE_ACCOUNT"
+          echo "##vso[task.setvariable variable=tfStateResourceGroup;isOutput=true]$TFSTATE_RG"
+
+
+- stage: RecoveryDecision
+  displayName: Recovery Decision
+  dependsOn: Preflight
+
+  variables:
+    recoveryScenario: $[ stageDependencies.Preflight.ClassifyRecovery.outputs['drClassification.recoveryScenario'] ]
+
+  jobs:
+  - job: Report
+    steps:
+    - script: |
+        set -euo pipefail
+
+        echo "=========================================="
+        echo "MAVENCREST DISASTER RECOVERY"
+        echo "=========================================="
+        echo "Scenario: $(recoveryScenario)"
+        echo ""
+
+        case "$(recoveryScenario)" in
+          reconcile)
+            echo "Infrastructure and Terraform state exist."
+            echo "Next action: controlled Terraform reconciliation."
+            ;;
+
+          state-loss)
+            echo "WARNING: Azure infrastructure exists but Terraform backend is missing."
+            echo "Do NOT rebuild infrastructure."
+            echo "Next action: recover state or import existing resources."
+            ;;
+
+          full-rebuild)
+            echo "Production infrastructure is considered unavailable."
+            echo "Next action: execute full platform rebuild."
+            ;;
+
+          validate-only)
+            echo "Validation-only mode selected."
+            ;;
+
+          *)
+            echo "ERROR: Unknown DR scenario."
+            exit 1
+            ;;
+        esac
+      displayName: Report Recovery Strategy
