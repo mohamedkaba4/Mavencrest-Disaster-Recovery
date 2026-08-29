@@ -30,6 +30,43 @@ The DR workflow rebuilds:
 4. Azure workloads
 5. Production health checks
 
+## Archetecture for Recovery Classification
+
+The DR pipeline first inspects the production environment and Terraform state backend before taking recovery action.
+
+```text
+AUTO classification
+│
+├─ prod + state exist
+│    → reconcile
+│    → DR pipeline does NOT rebuild
+│    → use normal orchestration
+│
+├─ prod exists + state missing
+│    → state-loss
+│    → STOP
+│    → recover state first
+│
+└─ prod missing
+     → full-rebuild
+          ↓
+     Resolve/Create backend
+          ↓
+     Foundation PLAN
+          ↓
+     HUMAN APPROVAL
+          ↓
+     Foundation APPLY
+          ↓
+     Build app images
+          ↓
+     Workload PLAN
+          ↓
+     HUMAN APPROVAL
+          ↓
+     Workload APPLY
+          ↓
+     Health checks
 ## Safety
 
 The DR pipeline is:
