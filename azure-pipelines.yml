@@ -32,6 +32,9 @@ variables:
   tfStateContainer: 'tfstate'
   foundationStateKey: 'foundation-prod.tfstate'
   workloadStateKey: 'workloads-prod.tfstate'
+  prodResourceGroup: 'rg-mavencrest-prod'
+  storefrontContainerApp: 'ca-mavencrest-prod-storefront'
+  adminContainerApp: 'ca-mavencrest-prod-admin'
 
 stages:
 
@@ -477,3 +480,281 @@ stages:
         docker push \
           "$ACR_LOGIN_SERVER/mavencrest-admin:$IMAGE_TAG"
       displayName: Build and Push DR Images
+
+- stage: WorkloadPlan
+  displayName: DR workload plan
+  dependsOn: 
+  - BuildRecoveryImages
+  - ResolveBackend
+
+  variables:
+    tfStateStorageAccount: $[ stageDependencies.ResolveBackend.Resolve.outputs['backendOutputs.tfStateStorageAccount'] ]
+    acrLoginServer: $[ stageDependencies.BuildRecoveryImages.BuildImages.outputs['imageOutputs.acrLoginServer'] ]
+
+  jobs:
+  - job: PlanWorkload
+    displayName: Plan Workload Recovery
+
+    steps:
+    - checkout: infra
+      path: s/infra
+
+    - script: |
+        set -euo pipefail
+
+        sudo apt-get update
+        sudo apt-get install -y gnupg software-properties-common curl
+
+        curl -fsSL https://apt.releases.hashicorp.com/gpg \
+          | sudo gpg --dearmor \
+          -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+        echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+        https://apt.releases.hashicorp.com \
+        $(lsb_release -cs) main" \
+          | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+        sudo apt-get update
+        sudo apt-get install -y terraform
+
+        terraform version
+      displayName: Install Terraform
+
+    - task: AzureCLI@2
+      displayName: Plan Workload Recovery
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          export ARM_USE_CLI=true
+          export ARM_USE_AZUREAD=true
+          export ARM_TENANT_ID="$(az account show --query tenantId -o tsv)"
+
+          echo "Verifying Terraform state access..."
+
+          az storage blob list \
+            --account-name "$(tfStateStorageAccount)" \
+            --container-name "$(tfStateContainer)" \
+            --auth-mode login \
+            --num-results 1 \
+            -o none
+
+           terraform \
+            -chdir=$(Pipeline.Workspace)/s/infra/terraform/workload \
+            init -reconfigure \
+            -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+            -backend-config="container_name=$(tfStateContainer)" \
+            -backend-config="key=$(workloadStateKey)" \
+            -backend-config="tenant_id=$ARM_TENANT_ID" \
+            -backend-config="use_cli=true" \
+            -backend-config="use_azuread_auth=true"
+
+           IMAGE_TAG="dr-$(Build.BuildId)"
+
+           STOREFRONT_IMAGE="$(acrLoginServer)/mavencrest-storefront:$IMAGE_TAG"
+           ADMIN_IMAGE="$(acrLoginServer)/mavencrest-admin:$IMAGE_TAG"
+
+           echo "Storefront image: $STOREFRONT_IMAGE"
+           echo "Admin image: $ADMIN_IMAGE"
+
+           terraform \
+            -chdir=$(Pipeline.Workspace)/s/infra/terraform/workload \
+            plan \
+            -var-file="prod.tfvars" \
+            -var="tfstate_storage_account_name=$(tfStateStorageAccount)" \
+            -var="tfstate_container_name=$(tfStateContainer)" \
+            -var="storefront_container_image=$STOREFRONT_IMAGE" \
+            -var="admin_container_image=$ADMIN_IMAGE" \
+            -out=workload.tfplan
+
+          echo "Checking workload plan for destructive actions..."
+
+          DESTROYS=$(terraform \
+            -chdir=$(Pipeline.Workspace)/s/infra/terraform/workload \
+            show -json workload.tfplan \
+            | jq '[.resource_changes[]? |
+              select(.change.actions | index("delete"))] |
+              length')
+
+          echo "Resources requiring deletion/replacement: $DESTROYS"
+
+          if [ "$DESTROYS" -gt 0 ]; then
+            echo "ERROR: Workload recovery plan contains destructive actions."
+            exit 1
+          fi
+
+          - publish: $(Pipeline.Workspace)/s/infra/terraform/workload/workload.tfplan
+            artifact: workload-plan
+            displayName: Publish Workload Plan
+
+- stage: ApplyWorkload
+  displayName: DR workload apply
+  dependsOn: 
+  - WorkloadPlan
+  - ResolveBackend
+
+  variables:
+    tfStateStorageAccount: $[ stageDependencies.ResolveBackend.Resolve.outputs['backendOutputs.tfStateStorageAccount'] ]
+
+  jobs:
+  - deployment: ApplyWorkload
+    displayName: Apply Approved Workload Plan
+    environment: Prod-DR
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: infra
+            path: s/infra
+
+          - download: current
+            artifact: workload-plan
+
+          - script: |
+              set -euo pipefail
+
+              sudo apt-get update
+              sudo apt-get install -y gnupg software-properties-common curl
+
+              curl -fsSL https://apt.releases.hashicorp.com/gpg \
+                | sudo gpg --dearmor \
+                -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+              echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+              https://apt.releases.hashicorp.com \
+              $(lsb_release -cs) main" \
+                | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+              sudo apt-get update
+              sudo apt-get install -y terraform
+
+              terraform version
+            displayName: Install Terraform
+
+          - task: AzureCLI@2
+            displayName: Apply Workload Recovery
+            inputs:
+              azureSubscription: '$(prodConnection)'
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                export ARM_USE_CLI=true
+                export ARM_USE_AZUREAD=true
+                export ARM_TENANT_ID="$(az account show --query tenantId -o tsv)"
+
+                terraform \
+                  -chdir=$(Pipeline.Workspace)/s/infra/terraform/workload \
+                  init -reconfigure \
+                  -backend-config="storage_account_name=$(tfStateStorageAccount)" \
+                  -backend-config="container_name=$(tfStateContainer)" \
+                  -backend-config="key=$(workloadStateKey)" \
+                  -backend-config="tenant_id=$ARM_TENANT_ID" \
+                  -backend-config="use_cli=true" \
+                  -backend-config="use_azuread_auth=true"
+
+                echo "Applying exact approved workload plan..."
+
+                terraform \
+                  -chdir=$(Pipeline.Workspace)/s/infra/terraform/workload \
+                  apply \
+                  -auto-approve \
+                  $(Pipeline.Workspace)/workload-plan/workload.tfplan
+
+- stage: DeployRecoveryImages
+  displayName: Deploy DR Images
+  dependsOn:
+  - ApplyWorkload
+  - BuildRecoveryImages
+
+  variables:
+    acrLoginServer: $[ stageDependencies.BuildRecoveryImages.BuildImages.outputs['imageOutputs.acrLoginServer'] ]
+
+  jobs:
+  - job: DeployImages
+    displayName: Deploy Recovered Application Images
+
+    steps:
+    - task: AzureCLI@2
+      displayName: Deploy DR Images to Container Apps
+      inputs:
+        azureSubscription: '$(prodConnection)'
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          set -euo pipefail
+
+          IMAGE_TAG="dr-$(Build.BuildId)"
+
+          STOREFRONT_IMAGE="$(acrLoginServer)/mavencrest-storefront:$IMAGE_TAG"
+          ADMIN_IMAGE="$(acrLoginServer)/mavencrest-admin:$IMAGE_TAG"
+
+          echo "Deploying Storefront: $STOREFRONT_IMAGE"
+
+          az containerapp update \
+            --name "$(storefrontContainerApp)" \
+            --resource-group "$(prodResourceGroup)" \
+            --image "$STOREFRONT_IMAGE" \
+            --revision-suffix "dr-$(Build.BuildId)" \
+            --output none
+
+          echo "Deploying Admin: $ADMIN_IMAGE"
+
+          az containerapp update \
+            --name "$(adminContainerApp)" \
+            --resource-group "$(prodResourceGroup)" \
+            --image "$ADMIN_IMAGE" \
+            --revision-suffix "dr-$(Build.BuildId)" \
+            --output none
+
+          echo "Recovery images deployed."
+
+- stage: ValidateRecovery
+  displayName: Validate DR Recovery
+  dependsOn: DeployRecoveryImages
+
+  jobs:
+  - job: HealthCheck
+    displayName: Production Health Validation
+
+    steps:
+    - script: |
+        set -euo pipefail
+
+        echo "Testing Storefront..."
+
+        curl \
+          --fail \
+          --retry 12 \
+          --retry-delay 10 \
+          --retry-all-errors \
+          --connect-timeout 10 \
+          https://store.az.mavencrest.site/api/health
+
+        echo ""
+        echo "Storefront healthy."
+
+        echo "Testing Admin..."
+
+        curl \
+          --fail \
+          --retry 12 \
+          --retry-delay 10 \
+          --retry-all-errors \
+          --connect-timeout 10 \
+          https://admin.az.mavencrest.site/api/health
+
+        echo ""
+        echo "Admin healthy."
+
+        echo ""
+        echo "=========================================="
+        echo "MAVENCREST DR RECOVERY SUCCESSFUL"
+        echo "Build: $(Build.BuildId)"
+        echo "=========================================="
+      displayName: Verify Recovered Production
